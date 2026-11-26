@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>위치·방위각 추적</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+:root{--bg:#fff;--fg:#14213d;--muted:#5b6475;--line:#d9dde5;--btn:#e8ebf0;--warn:#c62828}
+@media (prefers-color-scheme: dark){:root{--bg:#10151c;--fg:#e8ecf2;--muted:#9aa4b5;--line:#2a3340;--btn:#222b37;--warn:#ef5350}}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Noto Sans KR","Malgun Gothic",sans-serif;display:flex;flex-direction:column;box-sizing:border-box;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+#info{padding:10px 14px;font-size:18px;font-weight:600;line-height:1.4;min-height:52px}
+#addr{font-weight:500;color:var(--muted);font-size:16px}
+#mapwrap{position:relative;flex:1;min-height:200px}
+#map{position:absolute;inset:0}
+#compass{position:absolute;top:10px;right:10px;width:60px;height:60px;border-radius:50%;background:rgba(255,255,255,.92);border:1px solid #bbb;z-index:500}
+#compass span{position:absolute;top:2px;left:0;right:0;text-align:center;font-size:11px;font-weight:700;color:#333}
+#needle{position:absolute;inset:12px;transition:transform .3s}
+#arrow{transition:transform .3s}
+#panel{padding:10px 14px 12px;border-top:1px solid var(--line)}
+.row{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.row button{flex:0 0 76px;height:48px;border:0;border-radius:8px;background:var(--btn);color:var(--fg);font-size:18px;font-weight:600}
+.row button:disabled{opacity:.45}
+.row button:focus-visible{outline:3px solid #1e88e5}
+.row time{flex:1;font-size:15px;font-variant-numeric:tabular-nums}
+.stats{display:flex;justify-content:space-between;font-size:20px;font-weight:600;font-variant-numeric:tabular-nums}
+#legend{margin-top:4px;color:var(--warn);font-weight:600;font-size:14px}
+</style>
+</head>
+<body>
+<div id="info"><div id="pos">위치 확인 중…</div><div id="addr"></div></div>
+<div id="mapwrap">
+  <div id="map"></div>
+  <div id="compass"><span>N</span>
+    <svg id="needle" viewBox="0 0 36 36"><polygon points="18,2 24,18 12,18" fill="#c62828"/><polygon points="18,34 24,18 12,18" fill="#555"/></svg>
+  </div>
+</div>
+<div id="panel">
+  <div class="row"><button id="bStart">시작</button><time id="tStart">-</time></div>
+  <div class="row"><button id="bStop" disabled>정지</button><time id="tStop">-</time></div>
+  <div class="stats"><span>이동거리: <span id="dist">0 m</span></span><span>방위각: <span id="brg">-</span></span></div>
+  <div id="legend">방위각(0:N, 90:E, 180:S, 270:W, 360:N)</div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const map = L.map('map', {zoomControl:false}).setView([35.169, 128.98], 17);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19, attribution:'© OpenStreetMap contributors'}).addTo(map);
+const icon = L.divIcon({className:'', iconSize:[40,40], iconAnchor:[20,20],
+  html:'<div id="arrow"><svg viewBox="0 0 40 40" width="40" height="40"><polygon points="20,3 33,35 20,28 7,35" fill="#43a047" stroke="#1b5e20" stroke-width="2"/></svg></div>'});
+let marker = null, running = false, dist = 0, last = null, lastPos = null,
+    heading = null, geoT = 0, geoPos = null, wake = null;
+
+const rad = x => x * Math.PI / 180;
+function haversine(a, b){
+  const R = 6371000, dLat = rad(b[0]-a[0]), dLon = rad(b[1]-a[1]);
+  const h = Math.sin(dLat/2)**2 + Math.cos(rad(a[0]))*Math.cos(rad(b[0]))*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(h));
+}
+function bearing(a, b){
+  const y = Math.sin(rad(b[1]-a[1]))*Math.cos(rad(b[0]));
+  const x = Math.cos(rad(a[0]))*Math.sin(rad(b[0])) - Math.sin(rad(a[0]))*Math.cos(rad(b[0]))*Math.cos(rad(b[1]-a[1]));
+  return (Math.atan2(y, x)*180/Math.PI + 360) % 360;
+}
+const names = ['북','북동','동','남동','남','남서','서','북서'];
+const fmtTime = d => d.toLocaleString('ko-KR', {year:'2-digit', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit'});
+const fmtDist = m => m >= 1000 ? (m/1000).toFixed(2) + ' km' : Math.round(m) + ' m';
+
+function showHeading(){
+  if (heading == null) return;
+  $('brg').textContent = heading.toFixed(2) + ' ' + names[Math.round(heading/45) % 8];
+  const arrow = $('arrow'); if (arrow) arrow.style.transform = 'rotate(' + heading + 'deg)';
+  $('needle').style.transform = 'rotate(' + heading + 'deg)';
+}
+
+async function lookup(ll){
+  const now = Date.now();
+  if (now - geoT < 15000 || (geoPos && haversine(geoPos, ll) < 20)) return;
+  geoT = now; geoPos = ll;
+  try {
+    const r = await fetch('https://nominatim.openstreetmap.org/reverse?format=jsonv2&accept-language=ko&lat=' + ll[0] + '&lon=' + ll[1]);
+    const a = (await r.json()).address || {};
+    const parts = [a.state || a.city, a.borough || a.county || a.city_district, a.road, a.house_number];
+    $('addr').textContent = parts.filter(Boolean).join(' ');
+  } catch (e) { $('addr').textContent = '주소를 가져오지 못했어요 (인터넷 확인)'; }
+}
+
+function onPos(p){
+  const c = p.coords, ll = [c.latitude, c.longitude];
+  lastPos = ll;
+  $('pos').textContent = '위도:' + c.latitude.toFixed(3) + '  경도:' + c.longitude.toFixed(3) + '  고도:' + (c.altitude == null ? '-' : c.altitude.toFixed(3));
+  if (!marker) marker = L.marker(ll, {icon, interactive:false}).addTo(map); else marker.setLatLng(ll);
+  map.panTo(ll, {animate:true});
+  if (last) {
+    const d = haversine(last, ll);
+    if (d >= 3 && c.accuracy <= 40) {
+      if (running) { dist += d; $('dist').textContent = fmtDist(dist); }
+      heading = bearing(last, ll); last = ll;
+    }
+  } else last = ll;
+  if (c.heading != null && !isNaN(c.heading)) heading = c.heading;
+  showHeading();
+  lookup(ll);
+}
+function onErr(e){
+  $('pos').textContent = e.code === 1 ? '위치 권한을 허용해 주세요 (https 주소에서 열어야 해요)' : '위치를 확인할 수 없어요';
+}
+
+$('bStart').onclick = async () => {
+  running = true; dist = 0; last = lastPos;
+  $('dist').textContent = '0 m'; $('tStart').textContent = fmtTime(new Date()); $('tStop').textContent = '-';
+  $('bStart').disabled = true; $('bStop').disabled = false;
+  try { wake = await navigator.wakeLock.request('screen'); } catch (e) {}
+};
+$('bStop').onclick = () => {
+  running = false; $('tStop').textContent = fmtTime(new Date());
+  $('bStart').disabled = false; $('bStop').disabled = true;
+  if (wake) { wake.release(); wake = null; }
+};
+
+if (navigator.geolocation) navigator.geolocation.watchPosition(onPos, onErr, {enableHighAccuracy:true, maximumAge:1000, timeout:20000});
+else $('pos').textContent = '이 브라우저는 위치 기능을 지원하지 않아요';
+</script>
+</body>
+</html>
